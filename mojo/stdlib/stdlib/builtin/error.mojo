@@ -15,12 +15,17 @@
 These are Mojo built-ins, so you don't need to import them.
 """
 
-
+from builtin.debug_assert import debug_assert
+from collections.inline_array import InlineArray
 from collections.string.format import _CurlyEntryFormattable
+from compile.reflection import get_type_name
 from sys import external_call, is_gpu, _libc
 from sys.ffi import c_char
+from sys.info import sizeof, alignof
 
 from memory import memcpy, ArcPointer
+from memory.unsafe_pointer import OpaquePointer
+from memory.maybe_uninitialized import UnsafeMaybeUninitialized
 from io.write import _WriteBufferStack
 
 
@@ -96,6 +101,252 @@ struct StackTrace(Copyable, Stringable):
 
 
 # ===-----------------------------------------------------------------------===#
+# Errable
+# ===-----------------------------------------------------------------------===#
+
+
+trait Errable(Copyable, Movable, Representable, Stringable):
+    pass
+
+
+@fieldwise_init
+@register_passable("trivial")
+struct _ErrorVTableOp(Copyable, Movable):
+    var value: Int
+
+    alias Destroy = Self(0)
+    alias Copy = Self(1)
+    alias Str = Self(2)
+    alias IsA = Self(3)
+    alias IsAlive = Self(4)
+
+    @always_inline
+    fn __is__(self, other: Self) -> Bool:
+        return self.value == other.value
+
+
+@fieldwise_init
+@register_passable("trivial")
+struct _Tag[etype: Errable]:
+    pass
+
+
+@register_passable
+struct _ErrorVTable(Copyable, Movable):
+    var _dispatch: fn (
+        op: _ErrorVTableOp, *,
+        input: OpaquePointer,
+        output: OpaquePointer,
+    ) -> Bool
+
+    fn __init__(out self):
+        _ = self._dispatch = Self.noop_dispatch
+
+    fn __init__[etype: Errable](out self, tag: _Tag[etype]):
+        _ = self._dispatch = Self.dispatch_op[etype]
+
+    @staticmethod
+    fn _destroy_error_impl[etype: Errable](error: OpaquePointer):
+        var erased_pointer = error.bitcast[_ErasedPointer]()
+        erased_pointer.take_pointee().free_typed[etype]()
+
+    fn destroy_error(self, erased_pointer: _ErasedPointer):
+        _ = self._dispatch(
+            _ErrorVTableOp.Destroy,
+            input=UnsafePointer(to=erased_pointer).bitcast[NoneType](),
+            output=OpaquePointer(),
+        )
+
+    @staticmethod
+    fn _copy_error_impl[
+        etype: Errable
+    ](input: OpaquePointer, output: OpaquePointer):
+        var existing = input.bitcast[_ErasedPointer]()
+        var uninit = output.bitcast[UnsafeMaybeUninitialized[_ErasedPointer]]()
+
+        uninit[].write(_ErasedPointer(existing[].copy_typed[etype]()))
+
+    fn copy_error(
+        self,
+        erased_pointer: _ErasedPointer,
+    ) -> _ErasedPointer:
+        var copy = UnsafeMaybeUninitialized[_ErasedPointer]()
+        _ = self._dispatch(
+            _ErrorVTableOp.Copy,
+            input=UnsafePointer(to=erased_pointer).bitcast[NoneType](),
+            output=UnsafePointer(to=copy).bitcast[NoneType](),
+        )
+        return copy.unsafe_ptr().take_pointee()
+
+    @staticmethod
+    fn _str_error_impl[
+        etype: Errable
+    ](input: OpaquePointer, output: OpaquePointer):
+        var string = (
+            input.bitcast[_ErasedPointer]()[].get_pointer[etype]()[].__str__()
+        )
+        output.bitcast[UnsafeMaybeUninitialized[String]]()[].write(string^)
+
+    fn str_error(self, error: _ErasedPointer) -> String:
+        var string = UnsafeMaybeUninitialized[String]()
+        _ = self._dispatch(
+            _ErrorVTableOp.Str,
+            input=UnsafePointer(to=error).bitcast[NoneType](),
+            output=UnsafePointer(to=string).bitcast[NoneType](),
+        )
+        return string.unsafe_ptr().take_pointee()
+
+    @staticmethod
+    fn _isa_error_impl[
+        etype: Errable
+    ](input: OpaquePointer, output: OpaquePointer):
+        alias error_type_name = get_type_name[etype, qualified_builtins=True]()
+        var checked_type_name = input.bitcast[StaticString]()[]
+        var success = error_type_name == checked_type_name
+        output.bitcast[Bool]()[] = success
+
+    fn isa_error[etype: Errable](self) -> Bool:
+        var success = False
+        alias type_name = get_type_name[etype, qualified_builtins=True]()
+        _ = self._dispatch(
+            _ErrorVTableOp.IsA,
+            input=UnsafePointer(to=type_name).bitcast[NoneType](),
+            output=UnsafePointer(to=success).bitcast[NoneType](),
+        )
+        return success
+
+    fn __bool__(self) -> Bool:
+        return self._dispatch(
+            _ErrorVTableOp.IsAlive,
+            input=OpaquePointer(),
+            output=OpaquePointer(),
+        )
+
+    @staticmethod
+    fn noop_dispatch(
+        op: _ErrorVTableOp, error: OpaquePointer, result: OpaquePointer
+    ) -> Bool:
+        return False
+
+    @staticmethod
+    fn dispatch_op[
+        etype: Errable
+    ](op: _ErrorVTableOp, input: OpaquePointer, output: OpaquePointer) -> Bool:
+        if op is _ErrorVTableOp.Destroy:
+            Self._destroy_error_impl[etype](input)
+        elif op is _ErrorVTableOp.Copy:
+            Self._copy_error_impl[etype](input, output)
+        elif op is _ErrorVTableOp.Str:
+            Self._str_error_impl[etype](input, output)
+        elif op is _ErrorVTableOp.IsA:
+            Self._isa_error_impl[etype](input, output)
+        elif op is _ErrorVTableOp.IsAlive:
+            pass
+
+        return True
+
+
+@register_passable
+struct _ErasedPointer:
+    # TODO: make maybe-uninit to avoid needing to write `0` to the thing on init?
+    alias storage_type = SIMD[DType.index, 4]
+
+    var storage: Self.storage_type
+
+    fn __init__(out self):
+        self.storage = Self.storage_type(0)
+
+    fn __init__[T: AnyType & Movable](out self, var value: T):
+        self.storage = Self.storage_type(0)
+
+        @parameter
+        if Self.should_heap_allocate[T]():
+            # heap allocate
+            var allocation = UnsafePointer[T].alloc(1)
+            allocation.init_pointee_move(value^)
+            UnsafePointer(to=self.storage).bitcast[
+                OpaquePointer
+            ]()[] = allocation.bitcast[NoneType]()
+
+        else:
+            # use local buffer
+            var pointer = UnsafePointer(to=self.storage).bitcast[T]()
+            pointer.init_pointee_move(value^)
+
+    @staticmethod
+    fn should_heap_allocate[T: AnyType & Movable]() -> Bool:
+        # TODO: constrain the sizeof(storage) > sizeof(OpaquePointer)?
+        return (
+            sizeof[T]() > sizeof[Self.storage_type]()
+            or alignof[T]() > alignof[Self.storage_type]()
+            or not Bool(T.__moveinit__is_trivial)
+        )
+
+    fn _pointer_to_heap(ref self) -> OpaquePointer:
+        return UnsafePointer(to=self.storage).bitcast[OpaquePointer]()[]
+
+    fn _pointer_to_local(ref self) -> OpaquePointer:
+        return UnsafePointer(to=self.storage).bitcast[NoneType]()
+
+    fn get_pointer[T: AnyType & Movable](ref self) -> UnsafePointer[T]:
+        @parameter
+        if Self.should_heap_allocate[T]():
+            return self._pointer_to_heap().bitcast[T]()
+        else:
+            return self._pointer_to_local().bitcast[T]()
+
+    fn copy_typed[T: ExplicitlyCopyable & Movable](self) -> T:
+        return self.get_pointer[T]()[].copy()
+
+    fn free_typed[T: AnyType & Movable](deinit self):
+        var pointer = self.get_pointer[T]()
+        pointer.destroy_pointee()
+
+        @parameter
+        if Self.should_heap_allocate[T]():
+            pointer.free()
+
+
+@register_passable
+struct _TypeErasedError(Copyable, Movable, Stringable):
+    var data: _ErasedPointer
+    var vtable: _ErrorVTable
+
+    @always_inline
+    fn __init__(out self):
+        """Default constructor."""
+        self.data = _ErasedPointer()
+        self.vtable = _ErrorVTable()
+
+    fn __init__[etype: Errable, //](out self, var error: etype):
+        self.data = _ErasedPointer(error^)
+        self.vtable = _ErrorVTable(_Tag[etype]())
+
+    fn __copyinit__(out self, existing: Self):
+        self.data = existing.vtable.copy_error(existing.data)
+        self.vtable = existing.vtable
+
+    fn __del__(deinit self):
+        self.vtable.destroy_error(self.data)
+
+    fn __bool__(self) -> Bool:
+        """Returns True if the error is set and false otherwise.
+
+        Returns:
+          True if the error object contains a value and False otherwise.
+        """
+        return self.vtable.__bool__()
+
+    fn __str__(self) -> String:
+        return self.vtable.str_error(self.data)
+
+    fn isa[etype: Errable](self) -> Bool:
+        """Todo."""
+        var success = self.vtable.isa_error[etype]()
+        return success
+
+
+# ===-----------------------------------------------------------------------===#
 # Error
 # ===-----------------------------------------------------------------------===#
 
@@ -118,21 +369,8 @@ struct Error(
     # Fields
     # ===-------------------------------------------------------------------===#
 
-    var data: UnsafePointer[UInt8]
-    """A pointer to the beginning of the string data being referenced."""
-
-    var loaded_length: Int
-    """The length of the string being referenced.
-    Error instances conditionally own their error message. To reduce
-    the size of the error instance we use the sign bit of the length field
-    to store the ownership value. When loaded_length is negative it indicates
-    ownership and a free is executed in the destructor.
-    """
+    var data: _TypeErasedError
     var stack_trace: StackTrace
-    """The stack trace of the error.
-    By default the stack trace is not collected for the Error, unless user
-    sets the stack_trace_depth parameter to value >= 0.
-    """
 
     # ===-------------------------------------------------------------------===#
     # Life cycle methods
@@ -141,52 +379,19 @@ struct Error(
     @always_inline
     fn __init__(out self):
         """Default constructor."""
-        self.data = UnsafePointer[UInt8]()
-        self.loaded_length = 0
+        self.data = _TypeErasedError()
         self.stack_trace = StackTrace(depth=-1)
 
-    @always_inline
     @implicit
-    fn __init__(out self, value: StringLiteral):
-        """Construct an Error object with a given string literal.
+    fn __init__[etype: Errable, //](out self, var error: etype):
+        """Construct an Error object with a given error type.
 
         Args:
-            value: The error message.
-
+            error: The error.
         """
-        self.data = value.unsafe_ptr()
-        self.loaded_length = value.byte_length()
-        self.stack_trace = StackTrace(depth=0)
 
-    @implicit
-    fn __init__(out self, src: String):
-        """Construct an Error object with a given string.
-
-        Args:
-            src: The error message.
-        """
-        var length = src.byte_length()
-        var dest = UnsafePointer[UInt8].alloc(length + 1)
-        memcpy(dest, src.unsafe_ptr(), length)
-        dest[length] = 0
-        self.data = dest
-        self.loaded_length = -length
-        self.stack_trace = StackTrace(depth=0)
-
-    @implicit
-    fn __init__(out self, src: StringSlice):
-        """Construct an Error object with a given string ref.
-
-        Args:
-            src: The error message.
-        """
-        var length = src.byte_length()
-        var dest = UnsafePointer[UInt8].alloc(length + 1)
-        memcpy(dest, src.unsafe_ptr(), length)
-        dest[length] = 0
-        self.data = dest
-        self.loaded_length = -length
-        self.stack_trace = StackTrace(depth=0)
+        self.data = _TypeErasedError(error^)
+        self.stack_trace = StackTrace(depth=-1)
 
     @no_inline
     fn __init__[
@@ -212,29 +417,7 @@ struct Error(
             args[i].write_to(buffer)
 
         buffer.flush()
-        self = Error(output)
-
-    fn __del__(deinit self):
-        """Releases memory if allocated."""
-        if self.loaded_length < 0:
-            self.data.free()
-
-    fn __copyinit__(out self, existing: Self):
-        """Creates a deep copy of an existing error.
-
-        Args:
-            existing: The error to copy from.
-        """
-        if existing.loaded_length < 0:
-            var length = -existing.loaded_length
-            var dest = UnsafePointer[UInt8].alloc(length + 1)
-            memcpy(dest, existing.data, length)
-            dest[length] = 0
-            self.data = dest
-        else:
-            self.data = existing.data
-        self.loaded_length = existing.loaded_length
-        self.stack_trace = existing.stack_trace
+        self = Error(output^)
 
     # ===-------------------------------------------------------------------===#
     # Trait implementations
@@ -255,7 +438,8 @@ struct Error(
         Returns:
             A String of the error message.
         """
-        return String.write(self)
+
+        return self.data.__str__()
 
     @no_inline
     fn write_to(self, mut writer: Some[Writer]):
@@ -265,57 +449,26 @@ struct Error(
         Args:
             writer: The object to write to.
         """
-        if not self:
-            return
-        writer.write(self.as_string_slice())
+        # if not self:
+        #     return
+        writer.write(self.__str__())
 
-    @no_inline
     fn __repr__(self) -> String:
         """Converts the Error to printable representation.
 
         Returns:
             A printable representation of the error message.
         """
-        return String("Error(", repr(self.as_string_slice()), ")")
 
-    fn byte_length(self) -> Int:
-        """Get the length of the Error string in bytes.
-
-        Returns:
-            The length of the Error string in bytes.
-
-        Notes:
-            This does not include the trailing null terminator in the count.
-        """
-        return abs(self.loaded_length)
+        return String("Error(", self.__str__(), ")")
 
     # ===-------------------------------------------------------------------===#
     # Methods
     # ===-------------------------------------------------------------------===#
 
-    fn unsafe_cstr_ptr(self) -> UnsafePointer[c_char]:
-        """Retrieves a C-string-compatible pointer to the underlying memory.
-
-        The returned pointer is guaranteed to be NUL terminated, and not null.
-
-        Returns:
-            The pointer to the underlying memory.
-        """
-        return self.data.bitcast[c_char]()
-
-    fn as_string_slice(self) -> StringSlice[ImmutableAnyOrigin]:
-        """Returns a string slice of the data maybe owned by the Error.
-
-        Returns:
-            A string slice pointing to the data maybe owned by the Error.
-
-        Notes:
-            Since the data is not guaranteed to be owned by the Error, the
-            resulting StringSlice is given an ImmutableAnyOrigin.
-        """
-        return StringSlice[ImmutableAnyOrigin](
-            ptr=self.data, length=UInt(self.byte_length())
-        )
+    fn isa[etype: Errable](self) -> Bool:
+        """Todo."""
+        return self.data.isa[etype]()
 
     fn get_stack_trace(self) -> StackTrace:
         """Returns the stack trace of the error.

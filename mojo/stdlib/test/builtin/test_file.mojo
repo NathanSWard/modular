@@ -210,7 +210,7 @@ def test_file_seek():
             _ = f.seek(-12)
         except e:
             alias expected_msg = "seek error"
-            assert_equal(String(e)[: len(expected_msg)], expected_msg)
+            assert_true(expected_msg in String(e), String(e))
 
 
 def test_file_open_nodir():

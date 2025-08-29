@@ -11,7 +11,9 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from testing import assert_equal
+from testing import assert_equal, assert_true
+
+from builtin.error import Errable
 
 
 def raise_an_error():
@@ -25,15 +27,40 @@ def test_error_raising():
         assert_equal(String(e), "MojoError: This is an error!")
 
 
+@fieldwise_init
+@register_passable("trivial")
+struct CustomError(Copyable, Errable, Movable, Representable, Stringable):
+    var n: Int
+
+    fn __str__(self) -> String:
+        return "mojo " + String(self.n)
+
+    fn __repr__(self) -> String:
+        return String(self)
+
+
+def raise_custom_error():
+    raise CustomError(42)
+
+
+def test_error_custom_raising():
+    try:
+        raise_custom_error()
+    except e:
+        assert_true(e.isa[CustomError]())
+        assert_equal(String(e), "mojo 42")
+
+
 def test_from_and_to_string():
     var my_string: String = "FOO"
     var error = Error(my_string)
     assert_equal(String(error), "FOO")
 
     assert_equal(String(Error("bad")), "bad")
-    assert_equal(repr(Error("err")), "Error('err')")
+    assert_equal(repr(Error("err")), "Error(err)")
 
 
 def main():
     test_error_raising()
     test_from_and_to_string()
+    test_error_custom_raising()

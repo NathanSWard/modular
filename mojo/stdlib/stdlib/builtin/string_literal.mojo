@@ -15,6 +15,7 @@
 These are Mojo built-ins, so you don't need to import them.
 """
 
+from builtin.error import Errable
 from collections.string.format import _CurlyEntryFormattable
 from collections.string.string_slice import CodepointSliceIter, StaticString
 from os import PathLike
@@ -36,6 +37,7 @@ struct StringLiteral[value: __mlir_type.`!kgen.string`](
     ConvertibleToPython,
     Copyable,
     Defaultable,
+    Errable,
     ExplicitlyCopyable,
     FloatableRaising,
     IntableRaising,

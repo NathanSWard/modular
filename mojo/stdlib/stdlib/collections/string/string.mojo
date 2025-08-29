@@ -73,6 +73,7 @@ var ascii_str = ascii("Hello")  # ASCII-only string
 ```
 """
 
+from builtin.error import Errable
 from collections import KeyElement
 from collections._index_normalization import normalize_index
 from collections.string import CodepointsIter
@@ -113,6 +114,7 @@ struct String(
     ConvertibleFromPython,
     ConvertibleToPython,
     Defaultable,
+    Errable,
     ExplicitlyCopyable,
     FloatableRaising,
     IntableRaising,
