@@ -19,9 +19,11 @@ from builtin.debug_assert import debug_assert
 from collections.inline_array import InlineArray
 from collections.string.format import _CurlyEntryFormattable
 from compile.reflection import get_type_name
+from os import abort
 from sys import external_call, is_gpu, _libc
 from sys.ffi import c_char
-from sys.info import sizeof, alignof
+from sys.info import size_of, align_of
+from utils.static_tuple import StaticTuple
 
 from memory import memcpy, ArcPointer
 from memory.unsafe_pointer import OpaquePointer
@@ -105,7 +107,7 @@ struct StackTrace(Copyable, Stringable):
 # ===-----------------------------------------------------------------------===#
 
 
-trait Errable(Copyable, Movable, Representable, Stringable):
+trait Errable(Copyable, Movable, Stringable):
     pass
 
 
@@ -116,9 +118,9 @@ struct _ErrorVTableOp(Copyable, Movable):
 
     alias Destroy = Self(0)
     alias Copy = Self(1)
-    alias Str = Self(2)
-    alias IsA = Self(3)
-    alias IsAlive = Self(4)
+    alias Str = Self(3)
+    alias IsA = Self(4)
+    alias IsAlive = Self(5)
 
     @always_inline
     fn __is__(self, other: Self) -> Bool:
@@ -147,10 +149,10 @@ struct _ErrorVTable(Copyable, Movable):
 
     @staticmethod
     fn _destroy_error_impl[etype: Errable](error: OpaquePointer):
-        var erased_pointer = error.bitcast[_ErasedPointer]()
+        var erased_pointer = error.bitcast[_MaybeInlineErasedPointer]()
         erased_pointer.take_pointee().free_typed[etype]()
 
-    fn destroy_error(self, erased_pointer: _ErasedPointer):
+    fn destroy_error(self, erased_pointer: _MaybeInlineErasedPointer):
         _ = self._dispatch(
             _ErrorVTableOp.Destroy,
             input=UnsafePointer(to=erased_pointer).bitcast[NoneType](),
@@ -161,16 +163,16 @@ struct _ErrorVTable(Copyable, Movable):
     fn _copy_error_impl[
         etype: Errable
     ](input: OpaquePointer, output: OpaquePointer):
-        var existing = input.bitcast[_ErasedPointer]()
-        var uninit = output.bitcast[UnsafeMaybeUninitialized[_ErasedPointer]]()
+        var existing = input.bitcast[_MaybeInlineErasedPointer]()
+        var uninit = output.bitcast[UnsafeMaybeUninitialized[_MaybeInlineErasedPointer]]()
 
-        uninit[].write(_ErasedPointer(existing[].copy_typed[etype]()))
+        uninit[].write(_MaybeInlineErasedPointer(existing[].copy_typed[etype]()))
 
     fn copy_error(
         self,
-        erased_pointer: _ErasedPointer,
-    ) -> _ErasedPointer:
-        var copy = UnsafeMaybeUninitialized[_ErasedPointer]()
+        erased_pointer: _MaybeInlineErasedPointer,
+    ) -> _MaybeInlineErasedPointer:
+        var copy = UnsafeMaybeUninitialized[_MaybeInlineErasedPointer]()
         _ = self._dispatch(
             _ErrorVTableOp.Copy,
             input=UnsafePointer(to=erased_pointer).bitcast[NoneType](),
@@ -182,12 +184,11 @@ struct _ErrorVTable(Copyable, Movable):
     fn _str_error_impl[
         etype: Errable
     ](input: OpaquePointer, output: OpaquePointer):
-        var string = (
-            input.bitcast[_ErasedPointer]()[].get_pointer[etype]()[].__str__()
-        )
+        var ptr = input.bitcast[_MaybeInlineErasedPointer]()[].get_pointer[etype]()
+        var string = ptr[].__str__()
         output.bitcast[UnsafeMaybeUninitialized[String]]()[].write(string^)
 
-    fn str_error(self, error: _ErasedPointer) -> String:
+    fn str_error(self, error: _MaybeInlineErasedPointer) -> String:
         var string = UnsafeMaybeUninitialized[String]()
         _ = self._dispatch(
             _ErrorVTableOp.Str,
@@ -245,55 +246,45 @@ struct _ErrorVTable(Copyable, Movable):
 
         return True
 
-
 @register_passable
-struct _ErasedPointer:
-    # TODO: make maybe-uninit to avoid needing to write `0` to the thing on init?
-    alias storage_type = SIMD[DType.index, 4]
-
-    var storage: Self.storage_type
+struct _MaybeInlineErasedPointer:
+    alias storage_type = StaticTuple[OpaquePointer, 2]
+    var storage_or_pointer: Self.storage_type
 
     fn __init__(out self):
-        self.storage = Self.storage_type(0)
+        self.storage_or_pointer = StaticTuple[OpaquePointer, 2](fill=OpaquePointer())
 
     fn __init__[T: AnyType & Movable](out self, var value: T):
-        self.storage = Self.storage_type(0)
+        self.storage_or_pointer = StaticTuple[OpaquePointer, 2](fill=OpaquePointer())
 
         @parameter
-        if Self.should_heap_allocate[T]():
-            # heap allocate
+        if Self.is_inlineable[T]():
+            UnsafePointer(to=self.storage_or_pointer).bitcast[T]().init_pointee_move(value^)
+        else:
             var allocation = UnsafePointer[T].alloc(1)
             allocation.init_pointee_move(value^)
-            UnsafePointer(to=self.storage).bitcast[
-                OpaquePointer
-            ]()[] = allocation.bitcast[NoneType]()
-
-        else:
-            # use local buffer
-            var pointer = UnsafePointer(to=self.storage).bitcast[T]()
-            pointer.init_pointee_move(value^)
+            self.storage_or_pointer[0] = allocation.bitcast[NoneType]()
 
     @staticmethod
-    fn should_heap_allocate[T: AnyType & Movable]() -> Bool:
-        # TODO: constrain the sizeof(storage) > sizeof(OpaquePointer)?
+    fn is_inlineable[T: AnyType & Movable]() -> Bool:
         return (
-            sizeof[T]() > sizeof[Self.storage_type]()
-            or alignof[T]() > alignof[Self.storage_type]()
-            or not Bool(T.__moveinit__is_trivial)
+            size_of[T]() <= size_of[Self.storage_type]()
+            and align_of[T]() <= align_of[Self.storage_type]()
+            and Bool(T.__moveinit__is_trivial)
         )
 
-    fn _pointer_to_heap(ref self) -> OpaquePointer:
-        return UnsafePointer(to=self.storage).bitcast[OpaquePointer]()[]
+    fn _pointer_to_heap(self) -> OpaquePointer:
+        return self.storage_or_pointer[0]
 
-    fn _pointer_to_local(ref self) -> OpaquePointer:
-        return UnsafePointer(to=self.storage).bitcast[NoneType]()
+    fn _pointer_to_inline(self) -> OpaquePointer:
+        return UnsafePointer(to=self.storage_or_pointer).bitcast[NoneType]()
 
-    fn get_pointer[T: AnyType & Movable](ref self) -> UnsafePointer[T]:
+    fn get_pointer[origin: Origin, //, T: AnyType & Movable](ref [origin] self) -> UnsafePointer[T, mut=origin.mut, origin = origin]:
         @parameter
-        if Self.should_heap_allocate[T]():
-            return self._pointer_to_heap().bitcast[T]()
+        if Self.is_inlineable[T]():
+            return self._pointer_to_inline().bitcast[T]()
         else:
-            return self._pointer_to_local().bitcast[T]()
+            return self._pointer_to_heap().bitcast[T]()
 
     fn copy_typed[T: ExplicitlyCopyable & Movable](self) -> T:
         return self.get_pointer[T]()[].copy()
@@ -303,23 +294,22 @@ struct _ErasedPointer:
         pointer.destroy_pointee()
 
         @parameter
-        if Self.should_heap_allocate[T]():
+        if not Self.is_inlineable[T]():
             pointer.free()
 
 
-@register_passable
 struct _TypeErasedError(Copyable, Movable, Stringable):
-    var data: _ErasedPointer
+    var data: _MaybeInlineErasedPointer
     var vtable: _ErrorVTable
 
     @always_inline
     fn __init__(out self):
         """Default constructor."""
-        self.data = _ErasedPointer()
+        self.data = _MaybeInlineErasedPointer()
         self.vtable = _ErrorVTable()
 
     fn __init__[etype: Errable, //](out self, var error: etype):
-        self.data = _ErasedPointer(error^)
+        self.data = _MaybeInlineErasedPointer(error^)
         self.vtable = _ErrorVTable(_Tag[etype]())
 
     fn __copyinit__(out self, existing: Self):
@@ -327,7 +317,7 @@ struct _TypeErasedError(Copyable, Movable, Stringable):
         self.vtable = existing.vtable
 
     fn __del__(deinit self):
-        self.vtable.destroy_error(self.data)
+        self.vtable.destroy_error(self.data^)
 
     fn __bool__(self) -> Bool:
         """Returns True if the error is set and false otherwise.
@@ -351,7 +341,6 @@ struct _TypeErasedError(Copyable, Movable, Stringable):
 # ===-----------------------------------------------------------------------===#
 
 
-@register_passable
 struct Error(
     Boolable,
     Copyable,
@@ -391,7 +380,7 @@ struct Error(
         """
 
         self.data = _TypeErasedError(error^)
-        self.stack_trace = StackTrace(depth=-1)
+        self.stack_trace = StackTrace(depth=0)
 
     @no_inline
     fn __init__[
@@ -449,8 +438,10 @@ struct Error(
         Args:
             writer: The object to write to.
         """
-        # if not self:
-        #     return
+
+        if not self:
+            return
+
         writer.write(self.__str__())
 
     fn __repr__(self) -> String:
@@ -468,7 +459,20 @@ struct Error(
 
     fn isa[etype: Errable](self) -> Bool:
         """Todo."""
+
         return self.data.isa[etype]()
+
+    fn __getitem__[etype: Errable](ref self) -> ref [self] etype:
+        """Todo."""
+        if not self.isa[etype]():
+            abort("__getitem__: incorrect error type")
+
+        return self.unsafe_get[etype]()
+
+    fn unsafe_get[etype: Errable](ref self) -> ref [self] etype:
+        """Todo."""
+
+        return self.data.data.get_pointer[etype]().origin_cast[origin=__origin_of(self)]()[]
 
     fn get_stack_trace(self) -> StackTrace:
         """Returns the stack trace of the error.
@@ -477,6 +481,9 @@ struct Error(
             The stringable stack trace of the error.
         """
         return self.stack_trace
+
+    fn is_inline[etype: Errable](self) -> Bool:
+        return _MaybeInlineErasedPointer.is_inlineable[etype]()
 
 
 @doc_private

@@ -187,7 +187,7 @@ struct MoveCounter[T: ExplicitlyCopyable & Movable](
 # ===----------------------------------------------------------------------=== #
 
 
-struct MoveCopyCounter(Copyable, Movable):
+struct MoveCopyCounter(Copyable, Movable, Writable):
     var copied: Int
     var moved: Int
 
@@ -203,6 +203,13 @@ struct MoveCopyCounter(Copyable, Movable):
         self.copied = other.copied
         self.moved = other.moved + 1
 
+    fn write_to(self, mut writer: Some[Writer]):
+        writer.write("MoveCopyCounter(")
+        writer.write(self.copied)
+        writer.write(",")
+        writer.write(self.moved)
+        writer.write(")")
+
 
 # ===----------------------------------------------------------------------=== #
 # DelRecorder
@@ -210,12 +217,17 @@ struct MoveCopyCounter(Copyable, Movable):
 
 
 @fieldwise_init
-struct DelRecorder(Copyable, ExplicitlyCopyable, Movable):
+struct DelRecorder(Copyable, ExplicitlyCopyable, Movable, Writable):
     var value: Int
     var destructor_counter: UnsafePointer[List[Int]]
 
     fn __del__(deinit self):
         self.destructor_counter[].append(self.value)
+
+    fn write_to(self, mut writer: Some[Writer]):
+        writer.write("DelRecorder(")
+        writer.write(self.value)
+        writer.write(")")
 
 
 # ===----------------------------------------------------------------------=== #
